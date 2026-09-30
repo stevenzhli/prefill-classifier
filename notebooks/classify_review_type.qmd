@@ -1,0 +1,141 @@
+
+```{python}
+#|eval: false
+from classifier.single import GemmaSingleQuestionClassifier
+classifier = GemmaSingleQuestionClassifier()
+from matplotlib import figure
+```
+
+```{python}
+#|eval: false
+import pandas as pd
+import json
+
+df_train = pd.read_json('data/review_dataset.jsonl', lines=True)
+
+system_prompt = {
+  "instruction": "You are an expert customer review classifier. Analyze the provided customer review carefully, and classify it into the following classes.",
+  "choices": {
+    "movie": "This is a review about some motion pictures like a movie or a TV show.",
+    "book": "This is a review about a literature like a book or a book chapter.",
+    "music": "This is a review about a piece of music like an album or a record.",
+  }
+}
+
+choices = list(system_prompt['choices'].keys())
+print(choices)
+
+corpus = df_train.text.to_list()
+
+out = classifier.predict(
+  payloads=corpus,
+  classes=choices,
+  system_prompt=json.dumps(system_prompt, ensure_ascii=False),
+  # temperature=3
+)
+```
+
+```{python}
+df_out = pd.concat(
+  [
+    pd.DataFrame({
+      'text':corpus,
+      'ytrue':df_train.label, 
+      'clarity': df_train.clarity,
+      'ypred':out['prediction_labels'],
+      'latency':out['latency']
+    }), 
+  ], axis=1)
+```
+
+### Analyses
+
+Accuracy (zero-shot)
+- ~ 0.89
+
+```{python}
+print((df_out['ytrue'] == df_out['ypred']).mean())
+```
+
+Latency
+- ~ 70 ms per entry
+
+```{python}
+df_out.latency.describe()
+```
+
+Wrong predictions
+- Mostly low clarity cases (ambiguous)
+
+```{python}
+with pd.option_context('display.max_colwidth', 200):
+  display(df_out.query('ytrue!=ypred').sort_values('clarity'))
+```
+
+### Calibration
+
+#### Temperature Scaling
+
+```{python}
+
+```
+
+```{python}
+from calibration.scaler import compute_scaled_probas
+from calibration.scaler import expected_calibration_error
+from sklearn.metrics import log_loss
+import numpy as np
+
+def report_calibration_err(probas, ytrue):
+  print(f"log_loss={log_loss(ytrue, probas):.4f}")
+  print(f"ece={expected_calibration_error(ytrue, probas, choices):.4f}")
+
+label_to_index = {label: i for i, label in enumerate(choices)}
+ytrue = df_train.label.map(label_to_index)
+
+for temp in np.arange(1,6,0.1):
+  print(f'====Temperature: {temp}====')
+  probas = compute_scaled_probas(out['logits'], temperatures=temp)
+  report_calibration_err(probas, ytrue)
+
+probas1 = compute_scaled_probas(out['logits'], temperatures=1)
+probas2 = compute_scaled_probas(out['logits'], temperatures=3)
+```
+
+```{python}
+from calibration.plot import plot_classwise_calibration_curve, plot_predictive_calibration_curve
+
+p1a = plot_classwise_calibration_curve(df_out.ytrue, probas1, choices)
+p1b = plot_predictive_calibration_curve(df_out.ytrue, probas1, choices)
+
+p2a = plot_classwise_calibration_curve(df_out.ytrue, probas2, choices)
+p2b = plot_predictive_calibration_curve(df_out.ytrue, probas2, choices)
+
+display(p1a|p2a)
+display(p1b|p2b)
+```
+
+
+#### Platt Scaling
+
+Temperature scaling only works on the overall calibration, not per class, we can see for book the model is underconfident, but for movie it's overconfident. This is where we can leverage Platt scaling - essentially we'll fit a logistic regressor over raw logits to map to observed probabilities. 
+
+Platt scaling can alter the answer - becaues biaes and weights are applied across classes. 
+
+```{python}
+from calibration.scaler import MultiClassPlattScaler
+# 1. Fit the scaler on validation logits
+platt_scaler = MultiClassPlattScaler()
+platt_scaler.fit(out["logits"], ytrue)
+
+# 2. Get the class-corrected probabilities
+probas3 = platt_scaler.predict_proba(out["logits"])
+
+# 3. Plot
+p3a = plot_classwise_calibration_curve(df_out.ytrue, probas3, choices)
+p3b = plot_predictive_calibration_curve(df_out.ytrue, probas3, choices)
+
+display(p1a|p3a)
+display(p1b|p3b)
+```
+

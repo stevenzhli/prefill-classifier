@@ -1,0 +1,346 @@
+---
+title: "System One Model: Prefill-only Inteference with Logit-Extraction for Calibrated Decisions"
+format:
+  revealjs:
+    slide-number: true
+    center: true
+    transition: slide
+    theme: dark
+---
+
+## Agenda
+
+1. **The System One Model paradigm** - System One workflow, constraints & pricing
+2. **Jev usage deep dive** - Jev primitives, schemas, and confidence/score math
+3. **Assessing the approach** - Benchmarks & RLCD, pros & cons (prefill-only vs. decode), and a skeptical look at TypeSafe's claims
+4. **Putting it into practice** - Demo
+
+## System One Model
+
+System One gets its name from psychologist Daniel Kahneman’s landmark book *Thinking, Fast and Slow*.
+- System 1 thinking: fast, instinctive
+- System 2 thinking: slower, rational
+
+TypeSafe AI uses this idea to name a new type of AI architecture designed to mimic rapid, single-step decision-making.
+- State (evidence) + Typed question (options) → System 1 model (Jev) → Decision: Options with probability → Application logic
+
+- Jev
+  - **Latency:** 70–500 ms
+  - **Cost:** \$0.042 / MTok (input), \$0 (output)
+  - **Parallel sampling:** sending distinct questions per `state` does not increase latency
+  - **Calibrated probabilities** returned natively
+
+::: {.notes}
+- In psychology, "System 1" represents human brain’s fast and instinctive reactions—like instantly reactions. "System 2" is the slower, more deliberative, logical thinking.
+- TypeSafe AI uses this idea to name a new type of AI architecture designed to mimic the rapid, single-step decision-making. Traditional Large Language Models (LLMs) operate like "System 2" - slow and methodical, generating prose text word-by-word / "reasoning" loops to solve complex problems.
+
+Workflow: `state` (document, ticket, image) and `question` (typed yes/no, choice, or score question), structured `answers` out (probability for each option), consumed directly by application logic.
+:::
+
+## Jev - Constraints & Pricing
+
+**Input `State` + `Question` limits**
+
+- 32k tokens for the state plus the longest question (jev-1.13)
+- 64k for the state and every question together
+- Text only (no multimodal support)
+
+::: {.notes}
+32k ≈ 150k characters
+https://pydantic.dev/docs/ai/models/typesafe/
+:::
+
+**Per-question constraints**
+
+- Each `Choice` up to 255 options
+- Each `Score` up to 10 levels
+
+**Cost**
+
+| Model | Price (per MTok input) |
+|-------|------------------------|
+| Jev | \$0.042 |
+| Gemma 4 26B A4B | \$0.12 |
+| Haiku 4.5 | \$1.00 |
+
+- Shared state with isolated question branches - state tokens counted only once
+- "Output tokens" are free
+
+## Jev - Applications
+
+Instruction-based, low latency
+
+- Classification
+- Routing
+- Reranking
+
+::: {.notes}
+Multiple questions per state
+Reranking - parallel pointwise Noul with probability score
+::: 
+
+## Jev - Three Primitives
+
+1. **Choice**
+  - Independent categories.
+  - Returns: choice made, probability distribution over choices, and the confidence scalar.
+2. **Score**
+  - Ordinal levels.
+  - Returns: score (a fractional scalar on the scale), probability distribution over levels, and the confidence scalar.
+3. **Noul**
+  - A binary (yes/no) judgment.
+  - Returns: a single probability.
+
+## Jev - Typical Input
+
+```json
+{
+  "model": "jev-latest",
+  "state": {
+    "user_message": "I just checked my dashboard and my credit card was charged twice for the renewal, but the features are still locked! Fix this immediately...",
+    "recent_contacts": "2"
+  },
+  "questions": {
+    "department_routing": {
+      "type": "choice",
+      "instructions": "Which specialized department should this support ticket be routed to?",
+      "choices": {
+        "billing": "Payments, card errors, or refunds.",
+        "security": "Compromise, password reset, or MFA lockouts.",
+        "technical": "Operational error, broken UI, or other bugs."
+      }
+    },
+    "is_urgent_ticket": {
+      "type": "noul",
+      "instructions": "Does the user message express extreme urgency or threaten immediate financial/legal escalation?"
+    },
+    "user_frustration": {
+      "type": "score",
+      "instructions": "Rate the emotional frustration level of the user.",
+      "choices": ["calm", "annoyed", "furious"]
+    }
+  }
+}
+```
+
+The structured `state` / `questions` JSON maps onto a conventional JSON LLM call:
+
+- **state** - serialize `state` as context, serves as prompt prefix
+- **questions** - each question primitive serialized into a classification task
+  - **choice** - `questions.x.choices` become candidate labels for the model's structured output.
+  - **score** - an ordinal rubric; the model returns a value on the ladder.
+  - **noul** - a thresholded boolean the model is asked to return.
+
+```json
+{
+  "system": "Classify per the rubric. Output only JSON.",
+  "state": { "user_message": "...", "recent_contacts": "2" },
+  "questions": {
+    "department_routing": { "type": "choice", "instructions": "...", "choices": { ... } },
+    "is_urgent_ticket": { "type": "noul", "instructions": "..." },
+    "user_frustration": { "type": "score", "instructions": "...", "choices": ["calm","annoyed","furious"] },
+  }
+}
+```
+
+## Jev - Typical Output
+
+```json
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "department_routing": {
+      "type": "choice",
+      "choice": "billing",
+      "probabilities": { "billing": 0.94, "technical": 0.05, "sales": 0.01 },
+      "confidence": 0.92
+    },
+    "is_urgent_ticket": { "type": "noul", "noul": 0.87 },
+    "user_frustration": {
+      "type": "score",
+      "score": 1.55,
+      "probabilities": { "calm": 0.00, "annoyed": 0.45, "furious": 0.55 },
+      "confidence": 0.68
+    },
+  },
+  "usage": { "input_tokens": 180, "output_tokens": 24 }
+}
+```
+
+## Jev - Score & Confidence
+
+**Score**
+The probability-weighted expected index position on the ordered levels.
+
+$$
+\text{Score} = \sum \left( \text{i} \cdot p_i \right)
+$$
+
+**Confidence** (`Choice` and `Score`)
+A scalar measuring how much the probability mass concentrates on the most-likely choice.
+
+$$
+\text{Confidence}_{\text{choice}} = \frac{N \cdot p_{\max} - 1}{N - 1}\\
+~\\
+\text{Confidence}_{\text{score}} = \max\left( 0,\, 1- \frac{ \sum_i p_i|i-m| }{ \lfloor L^2/4\rfloor/L } \right)
+$$
+
+
+https://bernoulli.app/articles/is-jev-confident
+
+::: {.notes}
+Score: expectation of the ordered level distribution
+Confidence: measure the probability concentration, so should be interpreted as how confident the model is 
+:::
+
+## Jev - RLCD
+
+Probability calibation - make model output probabilities match empirical outcomes.
+
+**RLCD** - Reinforcement Learning for Calibrated Decisions
+- Proprietary method by TypeSafe AI
+- Reward when predicted probabiliteis match observed frequencies.
+
+Post-hoc calibration
+- Temperature scaling
+- Platt scaling
+- Isotonic regression
+
+https://www.jevtypesafeai.com/jev/rlcd
+
+https://scikit-learn.org/stable/modules/calibration.html
+
+::: {.notes}
+No specifics on how RLCD is done, TypeSafe only disclosed the objective of RLCD, but not the actual training algorithm/reward function. Their official RLCD page says the goal is to make probabilities match empirical outcomes. 
+
+
+But as DS we are not new to the idea of model calibration for classifiers. My understanding is essentially a classifier model that is trained to output calibrated probabilities. 
+
+RLCD - capability of outputting calibrated probabilities is baked into the model
+
+Post-hoc calibration - not fresh idea for DS
+:::
+
+## System One Model - Benchmarks
+
+Benchmarks for Jev-like implementations
+- benchmarkheaven.com/jev-models
+- dhruvmehra/jevbench
+
+::: {.notes}
+Since the announcement of Jev on Sep 15th, numerous open source alternatives have been published. 
+
+Note the calibration performance of Jev 1.13 isn't greatest. some evals found output probabilities not well calibrated compared to other model families.
+:::
+
+Two ways of implementation
+- Bidirectional encoder w/ BERT-like backbone (Laya)
+- Causal decoder w/ GPT-like backbone (JevK5, Hopper)
+
+https://archerhume.com/posts/jevs-architecture-unmasked/
+
+## Prefill-only Pros & Cons
+
+**Pros**
+
+- Instruction-following classifier
+- Prefill computation only, no output-token cost and latency
+- Prefix KV cache, broadcasted for processing questions in parallel
+- Deterministic output schema, zero retry due to type check failure
+- Calibrated probabilities for decision making (Jev)
+
+**Cons**
+
+- No generative output
+  - Cannot output the "why" for a choice
+- No reasoning
+- Hyped claims from TypeSafe AI
+  - "40x-200x faster, 10x-100x cheaper" - Real difference is just autoregressive decoding
+  - "Cannot hallucinate" - Only the output structure
+  - "Parallel sampling" - KV cache broadcast
+  - "Calibrated probabilities" - May vary by use case, recalibration still recommended for reliabitliy
+
+**Self-implementation**
+- + Reasoning can be activated
+- + Choice of opensource models
+- + Easy multimodal support
+- - Requires access to raw logits
+- - Calibration necessary for reliable probability output
+
+https://kantahayashiai.github.io/posts/jev-does-not-play-dice/
+
+::: {.notes}
+
+### Benefits of Prefill Only
+
+Because self-attention prefill must process the entire prompt regardless of what happens next, the latency difference between extracting logits via a single forward pass and running `generate(max_new_tokens=1)` on the same model is negligible (a few ms of loop overhead).
+
+The speed claims come from comparing against how LLMs actually run in production, not against 1-token generation.
+
+**1. Eliminating the "JSON Tax"** - real apps emit JSON (~20–30 tokens). At 50 tok/s that adds 400–600 ms of decoding after prefill. Logit extraction returns structured results at the millisecond prefill finishes.
+
+**2. Zero retry latency** - text generation can hallucinate formatting, triggering a retry that doubles latency. Logit extraction is type-safe; it emits the exact classes 100% of the time.
+
+**3. Engine-level optimizations** - a model that only outputs probabilities drops KV-cache generation machinery entirely.
+
+If you run Gemma-4 locally, switching from 1-token generation to logit extraction will not yield a 10× speedup - prefill still dominates. The win is eliminating 20–50 tokens of JSON formatting and never parsing a string or retrying.
+
+### TypeSafe AI's Claims - Skeptical View
+
+- **Speed boost / cost reduction** - smaller backbone model; savings only on generation when comparing to same model.
+- **No hallucination** - only of output *structure*, not of actual claims (accuracy).
+- **Parallel sampling** - easily achievable with prefix caching and broadcasting to questions.
+- **Calibrated probabilities** - some evals found output probabilities not well calibrated compared to other model families.
+
+:::
+
+## Demo - Prefill-Only Output
+
+```python
+from classifier.single import GemmaSingleQuestionClassifier
+classifier = GemmaSingleQuestionClassifier()
+
+import pandas as pd
+df_train = pd.read_json('data/test1.jsonl', lines=True)
+
+system_instruction = (
+    "You are an experienced customer review classifier. "
+    "Classify into: movie / book / music. No other text."
+)
+
+out = classifier.predict(
+    payloads=df_train.text.to_list(),
+    classes=["movie", "book", "music"],
+    system_prompt=system_instruction,
+)
+
+df_out = pd.DataFrame({
+    'text': corpus, 'ytrue': df_train.label,
+    'clarity': df_train.clarity, 'ypred': out['prediction_labels'],
+    'latency': out['latency'],
+})
+```
+
+- **Accuracy:** ~0.88
+- **Latency:** ~70 ms per entry
+- Wrong predictions are mostly low-clarity (ambiguous) cases
+
+## Demo - Probability Calibration
+
+- Since the model did not go through fine-tuning for calibration, the raw probability output is not calibrated.
+
+- **Temperature scaling** sweeps temperature and reports `log_loss` / `ECE`.
+  - Handles overall calibration but not per-class behavior (e.g. underconfident on *book*, overconfident on *movie*).
+  - Monotonic transform of the logits, so it preserves the argmax / decision
+
+- **Platt scaling** fits a logistic regressor over raw logits per class
+  - Can reorder the probabilities, potentially altering the decision
+
+## Questions
+
+::: {.notes}
+
+- Application: realtime reranking (parallel pointwise Noul with probability score)
+- RLCD - post-hoc calibration, temperature scaling, per-primitive calibration
+
+:::
